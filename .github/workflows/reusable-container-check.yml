@@ -1,0 +1,204 @@
+name: Container check (reusable)
+
+# Build a container image per architecture (locally, never pushed) and scan it
+# with Trivy. CRITICAL and HIGH vulnerabilities fail tag builds and only warn
+# on branch and pull request builds; secret findings always fail. Optionally
+# runs a pre-build job first (ex. theme assets) whose outputs are shared with
+# the per-arch builds through an artifact.
+#
+# Example caller:
+#
+#   jobs:
+#     container:
+#       uses: otpki/.github/.github/workflows/reusable-container-check.yml@v1
+#       with:
+#         image: otpki-keycloak
+#         node-version: '26'
+#         pre-build-commands: |
+#           cd theme && npm ci && npm run build-keycloak-theme
+#         pre-build-artifacts: theme/dist_keycloak
+
+on:
+  workflow_call:
+    inputs:
+      image:
+        description: Local image name used for the build and scan tags.
+        required: true
+        type: string
+      dockerfile:
+        description: Path to the Dockerfile relative to the repository root.
+        required: false
+        type: string
+        default: ./Dockerfile
+      context:
+        description: Docker build context relative to the repository root.
+        required: false
+        type: string
+        default: .
+      build-args:
+        description: Multiline build args passed to docker/build-push-action.
+        required: false
+        type: string
+        default: ""
+      platforms:
+        description: 'JSON array of {"platform": ..., "runner": ...} objects for the per-arch build matrix.'
+        required: false
+        type: string
+        default: '[{"platform":"linux/amd64","runner":"ubuntu-latest"},{"platform":"linux/arm64","runner":"ubuntu-24.04-arm"}]'
+      pre-build-commands:
+        description: Multiline shell commands run once before the image builds. Empty skips the pre-build job.
+        required: false
+        type: string
+        default: ""
+      pre-build-artifacts:
+        description: Path whose contents are shared with the image builds. Required when pre-build-commands produce files the Dockerfile copies.
+        required: false
+        type: string
+        default: ""
+      node-version:
+        description: Node.js version for the pre-build job. Empty skips setup-node.
+        required: false
+        type: string
+        default: ""
+      node-cache-path:
+        description: Dependency file passed to setup-node caching (ex. theme/package-lock.json).
+        required: false
+        type: string
+        default: ""
+      allow-trivy-config-override:
+        description: "Allow the repo's own Trivy config/.trivyignore to replace the bundled org policy (false = bundled policy enforced, .trivyignore neutralized)"
+        required: false
+        type: boolean
+        default: false
+
+permissions: {}
+
+jobs:
+  pre-build:
+    name: Pre-build artifacts
+    if: inputs.pre-build-commands != ''
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Resolve tool versions
+        id: versions
+        uses: otpki/.github/.github/actions/tool-versions@v1
+        with:
+          versions-ref: ${{ job.workflow_ref }}
+
+      - name: Setup Node.js
+        if: inputs.node-version != '' || steps.versions.outputs.node != ''
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ inputs.node-version != '' && inputs.node-version || steps.versions.outputs.node }}
+          cache: npm
+          cache-dependency-path: ${{ inputs.node-cache-path != '' && inputs.node-cache-path || 'package-lock.json' }}
+
+      - name: Pre-build
+        shell: bash
+        env:
+          PRE_BUILD_COMMANDS: ${{ inputs.pre-build-commands }}
+        run: eval "$PRE_BUILD_COMMANDS"
+
+      - name: Upload pre-build artifacts
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: pre-build-artifacts
+          path: ${{ inputs.pre-build-artifacts }}
+          if-no-files-found: error
+          retention-days: 1
+
+  build:
+    name: Build and scan ${{ matrix.platform }}
+    permissions:
+      contents: read
+      checks: write
+    needs: pre-build
+    if: always() && (needs.pre-build.result == 'success' || needs.pre-build.result == 'skipped')
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(inputs.platforms) }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Download pre-build artifacts
+        if: inputs.pre-build-artifacts != ''
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: pre-build-artifacts
+          path: ${{ inputs.pre-build-artifacts }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Build (${{ matrix.platform }}) - local only, no push
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: ${{ inputs.context }}
+          file: ${{ inputs.dockerfile }}
+          platforms: ${{ matrix.platform }}
+          push: false
+          load: true
+          tags: ${{ inputs.image }}:ci
+          build-args: ${{ inputs.build-args }}
+          provenance: false
+          cache-from: type=gha,scope=${{ inputs.image }}-${{ matrix.platform }}
+          cache-to: type=gha,mode=max,scope=${{ inputs.image }}-${{ matrix.platform }}
+
+      - name: Resolve Trivy policy
+        id: trivycfg
+        env:
+          WF_REF: ${{ job.workflow_ref }}
+        run: |
+          set -euo pipefail
+          if ${{ inputs.allow-trivy-config-override }}; then
+            echo "config=" >> "$GITHUB_OUTPUT"
+            echo "trivyignores=" >> "$GITHUB_OUTPUT"
+          else
+            curl -fsSL "https://raw.githubusercontent.com/otpki/.github/${WF_REF##*@}/templates/trivy.yaml" -o "${{ runner.temp }}/trivy.yaml"
+            touch "${{ runner.temp }}/empty-trivyignore"
+            echo "config=${{ runner.temp }}/trivy.yaml" >> "$GITHUB_OUTPUT"
+            echo "trivyignores=${{ runner.temp }}/empty-trivyignore" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Trivy scan
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ${{ inputs.image }}:ci
+          format: json
+          output: trivy-report.json
+          scanners: vuln,secret
+          trivy-config: ${{ steps.trivycfg.outputs.config }}
+          trivyignores: ${{ steps.trivycfg.outputs.trivyignores }}
+          exit-code: '0'
+
+      - name: Platform slug
+        id: platform-slug
+        env:
+          PLATFORM: ${{ matrix.platform }}
+        run: echo "slug=$(echo "$PLATFORM" | tr '/' '-')" >> "$GITHUB_OUTPUT"
+
+      - name: Gate verdict
+        if: always()
+        uses: otpki/.github/.github/actions/trivy-gate-verdict@v1
+        with:
+          trivy-report: trivy-report.json
+          mode: ${{ startsWith(github.ref, 'refs/tags/') && 'enforce' || 'warn' }}
+          check-name: trivy-gate-${{ matrix.platform }}
+
+      - name: Upload scan report
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: trivy-report-${{ steps.platform-slug.outputs.slug }}
+          path: trivy-report.json
+          if-no-files-found: ignore

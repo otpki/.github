@@ -1,0 +1,91 @@
+name: CodeQL (reusable)
+
+# Shared CodeQL analysis for OTPKI repositories. Callers define their own
+# triggers (push, pull_request, schedule) and pass a languages matrix plus any
+# commands needed for manual build-mode entries.
+#
+# Example caller:
+#
+#   jobs:
+#     analyze:
+#       permissions:
+#         contents: read
+#         security-events: write
+#       uses: otpki/.github/.github/workflows/reusable-codeql.yml@v1
+#       with:
+#         languages: '[{"language":"actions","build-mode":"none"},{"language":"go","build-mode":"manual"}]'
+
+on:
+  workflow_call:
+    inputs:
+      languages:
+        description: 'JSON array of {"language": ..., "build-mode": ...} objects for the analysis matrix.'
+        required: false
+        type: string
+        default: '[{"language":"actions","build-mode":"none"}]'
+      build-commands:
+        description: Shell commands run for matrix entries with build-mode manual. Runs from the repository root.
+        required: false
+        type: string
+        default: ""
+      queries:
+        description: CodeQL query suite passed to init.
+        required: false
+        type: string
+        default: security-extended
+      go-version-file:
+        description: File passed to actions/setup-go for Go languages that need a toolchain.
+        required: false
+        type: string
+        default: go.mod
+
+permissions: {}
+
+jobs:
+  analyze:
+    name: Analyze (${{ matrix.language }})
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(inputs.languages) }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: false
+          persist-credentials: false
+
+      - name: Setup Go
+        if: matrix.language == 'go' && matrix.build-mode != 'none'
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: ${{ inputs.go-version-file }}
+          check-latest: true
+          cache: true
+
+      - name: Setup Rust
+        if: matrix.language == 'rust' && matrix.build-mode != 'none'
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@f3bbb05694c2f74569081c28664c0866d64dec21 # v4.39.3
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: ${{ matrix.build-mode }}
+          queries: ${{ inputs.queries }}
+
+      - name: Build (manual)
+        if: matrix.build-mode == 'manual'
+        shell: bash
+        env:
+          BUILD_COMMANDS: ${{ inputs.build-commands != '' && inputs.build-commands || 'go build ./...' }}
+        run: eval "$BUILD_COMMANDS"
+
+      - name: Analyze
+        uses: github/codeql-action/analyze@f3bbb05694c2f74569081c28664c0866d64dec21 # v4.39.3
+        with:
+          category: /language:${{ matrix.language }}

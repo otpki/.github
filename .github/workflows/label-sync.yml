@@ -1,0 +1,48 @@
+name: label-sync
+
+# Syncs templates/labels.yml to every public otpki repo. Runs on changes to
+# the label file and weekly to pick up drift.
+
+on:
+  push:
+    branches: [main]
+    paths: [templates/labels.yml]
+  schedule:
+    - cron: "0 7 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Generate GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3
+        with:
+          client-id: ${{ secrets.GH_APP_CLIENT_ID }}
+          private-key: ${{ secrets.GH_APP_PRIVATE_KEY }}
+          owner: otpki # zizmor: ignore[github-app] repo set is enumerated at runtime, job exists to cover every public repo
+          permission-issues: write
+
+      - name: Sync labels to public repos
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          set -euo pipefail
+          gh repo list otpki --visibility public --limit 100 --json name --jq '.[].name' | while read -r repo; do
+            yq -o=json '.' templates/labels.yml | jq -c '.[]' | while read -r label; do
+              gh label create "$(jq -r '.name' <<<"$label")" \
+                --repo "otpki/${repo}" \
+                --color "$(jq -r '.color' <<<"$label")" \
+                --description "$(jq -r '.description' <<<"$label")" \
+                --force
+            done
+            echo "synced ${repo}"
+          done

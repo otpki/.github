@@ -1,0 +1,173 @@
+name: Go check (reusable)
+
+# Shared checkout + Go + Just + aqua tooling setup for OTPKI repositories.
+# Callers define triggers and pass the check commands (usually just recipes)
+# as a multiline string. Repositories with private Go module dependencies can
+# pass GitHub App credentials and a repository list for git insteadOf auth.
+#
+# Example caller:
+#
+#   jobs:
+#     check:
+#       uses: otpki/.github/.github/workflows/reusable-go-check.yml@v1
+#       with:
+#         commands: |
+#           just format-check
+#           just lint
+#           just test-ci
+#           just tidy
+
+on:
+  workflow_call:
+    inputs:
+      commands:
+        description: Multiline shell commands run after the environment is set up.
+        required: true
+        type: string
+      os-matrix:
+        description: JSON array of runner labels for the job matrix.
+        required: false
+        type: string
+        default: '["ubuntu-latest"]'
+      parent-repository:
+        description: Repository checked out at the workspace root before this repo, for `replace => ..` module layouts (ex. otpki/pkcs11).
+        required: false
+        type: string
+        default: ""
+      checkout-path:
+        description: Path the calling repository is checked out into, relative to the workspace root.
+        required: false
+        type: string
+        default: .
+      setup-go:
+        description: Install Go. Disable for repositories without Go code.
+        required: false
+        type: boolean
+        default: true
+      go-version:
+        description: Explicit Go version for setup-go. When empty, go-version-file is used.
+        required: false
+        type: string
+        default: ""
+      go-version-file:
+        description: File passed to actions/setup-go when go-version is empty.
+        required: false
+        type: string
+        default: go.mod
+      tools:
+        description: Install aqua-managed dev tools with `just tools`.
+        required: false
+        type: boolean
+        default: true
+      check-clean-tree:
+        description: Fail if commands left changes in the working tree.
+        required: false
+        type: boolean
+        default: true
+      vulncheck-command:
+        description: Optional command run as a non-blocking advisory step.
+        required: false
+        type: string
+        default: ""
+      working-directory:
+        description: Directory the commands run in, relative to the repository root.
+        required: false
+        type: string
+        default: .
+      submodules:
+        description: Whether actions/checkout should fetch submodules.
+        required: false
+        type: boolean
+        default: false
+      fetch-base-ref:
+        description: Base branch fetched as refs/remotes/origin/<name>, for checks that diff against it (ex. buf breaking). Empty skips the fetch.
+        required: false
+        type: string
+        default: ""
+      private-repositories:
+        description: Multiline list of extra otpki org repositories the GitHub App token should access. Empty skips private-dependency setup.
+        required: false
+        type: string
+        default: ""
+    secrets:
+      GH_APP_CLIENT_ID:
+        description: GitHub App Client ID for private dependency access. Required when private-repositories is set.
+        required: false
+      GH_APP_PRIVATE_KEY:
+        description: GitHub App private key for private dependency access. Required when private-repositories is set.
+        required: false
+
+permissions: {}
+
+jobs:
+  check:
+    name: Check (${{ matrix.os }})
+    permissions:
+      contents: read
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: ${{ fromJSON(inputs.os-matrix) }}
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    steps:
+      - name: Checkout parent module repository
+        if: inputs.parent-repository != ''
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ inputs.parent-repository }}
+          persist-credentials: false
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: ${{ inputs.checkout-path }}
+          submodules: ${{ inputs.submodules }}
+          persist-credentials: false
+
+      - name: Fetch base ref
+        if: inputs.fetch-base-ref != ''
+        shell: bash
+        working-directory: ${{ inputs.checkout-path }}
+        env:
+          FETCH_REF: ${{ inputs.fetch-base-ref }}
+        run: git fetch --no-tags --depth=1 origin "+refs/heads/${FETCH_REF}:refs/remotes/origin/${FETCH_REF}"
+
+      - name: Setup CI
+        uses: otpki/.github/.github/actions/setup-ci@v1
+        with:
+          setup-go: ${{ inputs.setup-go }}
+          go-version: ${{ inputs.go-version }}
+          go-version-file: ${{ inputs.go-version-file }}
+          tools: ${{ inputs.tools }}
+          working-directory: ${{ inputs.working-directory }}
+          github-app-id: ${{ inputs.private-repositories != '' && secrets.GH_APP_CLIENT_ID || '' }}
+          github-app-private-key: ${{ secrets.GH_APP_PRIVATE_KEY }}
+          private-repositories: ${{ inputs.private-repositories }}
+
+      - name: Check
+        shell: bash
+        env:
+          CHECK_COMMANDS: ${{ inputs.commands }}
+        run: eval "$CHECK_COMMANDS"
+
+      - name: Working tree stays clean
+        if: inputs.check-clean-tree
+        shell: bash
+        run: |
+          if [ -n "$(git status --porcelain)" ]; then
+            echo "Generation, tidy, or formatting left changes:"
+            git status --porcelain
+            git diff
+            exit 1
+          fi
+
+      - name: Vulnerability scan (advisory)
+        if: inputs.vulncheck-command != ''
+        continue-on-error: true
+        shell: bash
+        env:
+          VULNCHECK_COMMAND: ${{ inputs.vulncheck-command }}
+        run: eval "$VULNCHECK_COMMAND"

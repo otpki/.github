@@ -1,0 +1,156 @@
+name: Setup CI
+description: Install Go, aqua-managed dev tools, and Just for OTPKI repositories
+
+# Shared CI environment setup used by the reusable workflows and by
+# repo-specific workflows that need the same toolchain inline:
+#
+#   - uses: otpki/.github/.github/actions/setup-ci@v1
+#     with:
+#       tools: 'false'
+
+inputs:
+  setup-go:
+    description: Install Go ("false" for repositories without Go code)
+    required: false
+    default: "true"
+  go-version:
+    description: Explicit Go version for setup-go. When empty, go-version-file is used
+    required: false
+    default: ""
+  go-version-file:
+    description: File passed to actions/setup-go when go-version is empty
+    required: false
+    default: go.mod
+  tools:
+    description: Install dev tools (see tools-command). "false" skips tool install
+    required: false
+    default: "true"
+  tools-command:
+    description: Command used to install dev tools when tools is not "false"
+    required: false
+    default: "just tools"
+  cache-npm:
+    description: Cache ~/.npm keyed on package-lock.json files
+    required: false
+    default: "false"
+  init-submodules:
+    description: Run git submodule sync + update --init --recursive after checkout
+    required: false
+    default: "false"
+  registry-login:
+    description: Log in to a container registry
+    required: false
+    default: "false"
+  registry-url:
+    description: Container registry URL for registry-login
+    required: false
+    default: ""
+  registry-username:
+    description: Container registry username for registry-login
+    required: false
+    default: ""
+  registry-password:
+    description: Container registry password for registry-login
+    required: false
+    default: ""
+  working-directory:
+    description: Directory containing .aqua.yaml and the Justfile, relative to the workspace root
+    required: false
+    default: .
+  github-app-id:
+    description: GitHub App ID for private dependency access. Empty skips private-dependency setup
+    required: false
+    default: ""
+  github-app-private-key:
+    description: GitHub App private key for private dependency access
+    required: false
+    default: ""
+  private-repositories:
+    description: Multiline list of extra otpki org repositories the GitHub App token should access
+    required: false
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    - name: Generate GitHub App token
+      id: app-token
+      if: inputs.github-app-id != ''
+      uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3
+      with:
+        client-id: ${{ inputs.github-app-id }}
+        private-key: ${{ inputs.github-app-private-key }}
+        owner: otpki
+        repositories: |
+          ${{ github.event.repository.name }}
+          ${{ inputs.private-repositories }}
+        permission-contents: read
+
+    - name: Configure private GitHub dependencies
+      if: inputs.github-app-id != ''
+      shell: bash
+      env:
+        GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
+      run: git config --global url."https://x-access-token:${GITHUB_TOKEN}@github.com/".insteadOf "https://github.com/"
+
+    - name: Initialize submodules
+      if: inputs.init-submodules == 'true'
+      shell: bash
+      run: |
+        git submodule sync --recursive
+        git submodule update --init --recursive
+
+    - name: Setup Go
+      if: inputs.setup-go == 'true' && inputs.go-version == ''
+      uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+      with:
+        go-version-file: ${{ inputs.go-version-file }}
+        check-latest: true
+        cache: true
+
+    - name: Setup Go
+      if: inputs.setup-go == 'true' && inputs.go-version != ''
+      uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+      with:
+        go-version: ${{ inputs.go-version != '' && inputs.go-version || steps.versions.outputs.go }}
+        check-latest: true
+        cache: true
+
+    - name: Cache aqua-managed tools
+      if: inputs.tools == 'true'
+      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ${{ inputs.working-directory }}/.tool
+        key: aqua-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles(format('{0}/.aqua.yaml', inputs.working-directory), format('{0}/Justfile', inputs.working-directory)) }}
+        restore-keys: |
+          aqua-v1-${{ runner.os }}-${{ runner.arch }}-
+
+    - name: Cache npm downloads
+      if: inputs.cache-npm == 'true'
+      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ~/.npm
+        key: npm-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('**/package-lock.json') }}
+        restore-keys: |
+          npm-v1-${{ runner.os }}-${{ runner.arch }}-
+
+    - name: Setup Just
+      uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4
+      with:
+        just-version: "1.59.0"
+
+    - name: Install dev tools
+      if: inputs.tools == 'true'
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        TOOLS_COMMAND: ${{ inputs.tools-command }}
+      run: eval "$TOOLS_COMMAND"
+
+    - name: Login to registry
+      if: inputs.registry-login == 'true'
+      uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+      with:
+        registry: ${{ inputs.registry-url }}
+        username: ${{ inputs.registry-username }}
+        password: ${{ inputs.registry-password }}

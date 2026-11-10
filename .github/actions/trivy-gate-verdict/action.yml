@@ -1,0 +1,113 @@
+name: Trivy gate verdict
+description: >-
+  Reads a trivy JSON report, lists findings in the job summary, applies the
+  warn/enforce gate (secrets and other findings always fail; CRITICAL/HIGH
+  vulnerabilities warn in warn mode, fail in enforce), and publishes the
+  verdict as a check run when the job grants checks: write. Never prints
+  secret match content — only counts.
+
+inputs:
+  trivy-report:
+    description: Path to the trivy JSON report
+    required: false
+    default: trivy-report.json
+  mode:
+    description: '"warn" for branch/PR builds, "enforce" for tag builds and unrecognized refs'
+    required: true
+  check-name:
+    description: Check run name for the verdict (unique per matrix leg)
+    required: true
+  commit:
+    description: Commit SHA the check run attaches to. Defaults to the PR head sha on pull_request, else github.sha
+    required: false
+    default: ""
+  github-token:
+    required: false
+    default: ${{ github.token }}
+
+runs:
+  using: composite
+  steps:
+    - name: Verdict
+      if: always()
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+        MODE: ${{ inputs.mode }}
+        REPORT: ${{ inputs.trivy-report }}
+        CHECK_NAME: ${{ inputs.check-name }}
+        COMMIT: ${{ inputs.commit != '' && inputs.commit || (github.event.pull_request.head.sha || github.sha) }}
+      run: |
+        set -euo pipefail
+
+        if [ ! -f "$REPORT" ]; then
+          echo "::error::Trivy report missing — the scan did not produce output; fails every build type"
+          exit 1
+        fi
+
+        vulns="$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity == "CRITICAL" or .Severity == "HIGH")] | length' "$REPORT")"
+        secrets="$(jq '[.Results[]?.Secrets[]?] | length' "$REPORT")"
+        others="$(jq '[.Results[]?.Misconfigurations[]?, .Results[]?.Licenses[]?] | length' "$REPORT" 2>/dev/null || echo 0)"
+
+        # One row per finding, capped at 50 for output size limits. Titles are
+        # sanitized (pipes would break the markdown table).
+        vuln_table="$(jq -r '
+          [.Results[]?.Vulnerabilities[]? | select(.Severity == "CRITICAL" or .Severity == "HIGH")]
+          | unique_by(.VulnerabilityID + "-" + .PkgName)
+          | sort_by(.Severity, .VulnerabilityID)
+          | .[0:50][]
+          | "| `\(.PkgName // "—")` | [\(.VulnerabilityID)](\(.PrimaryURL // "")) | \(.Severity) | `\(.InstalledVersion // "—")` | `\(.FixedVersion // "—")` | \((.Title // "") | gsub("\\|"; "—") | .[0:100]) |"
+        ' "$REPORT")"
+        cve_list="$(jq -r '[.Results[]?.Vulnerabilities[]? | select(.Severity == "CRITICAL" or .Severity == "HIGH") | .VulnerabilityID] | unique | join(", ")' "$REPORT")"
+
+        {
+          echo "### Trivy verdict — \`$CHECK_NAME\`"
+          echo
+          echo "| Finding | Count |"
+          echo "| --- | --- |"
+          echo "| CRITICAL/HIGH vulnerabilities | \`$vulns\` |"
+          echo "| Secrets | \`$secrets\` |"
+          echo "| Other findings | \`$others\` |"
+          echo
+          echo "Gate mode: \`$MODE\`"
+          if [ -n "$vuln_table" ]; then
+            echo
+            echo "#### Vulnerabilities"
+            echo
+            echo "| Package | CVE | Severity | Installed | Fixed | Title |"
+            echo "| --- | --- | --- | --- | --- | --- |"
+            echo "$vuln_table"
+            [ "$vulns" -gt 50 ] && echo "_…and $((vulns - 50)) more; see the uploaded trivy-report artifact._"
+          fi
+        } >> "$GITHUB_STEP_SUMMARY"
+
+        conclusion=success
+        if [ "$secrets" -gt 0 ] || [ "$others" -gt 0 ]; then
+          echo "::error::Trivy found $secrets secret finding(s) and $others other finding(s); these fail every build type"
+          conclusion=failure
+        elif [ "$vulns" -gt 0 ]; then
+          if [ "$MODE" = "enforce" ]; then
+            echo "::error::Trivy found $vulns CRITICAL/HIGH vulnerabilities; this ref enforces a clean scan"
+            conclusion=failure
+          else
+            echo "::warning::Trivy found $vulns CRITICAL/HIGH vulnerabilities (non-blocking in warn mode)"
+            conclusion=action_required
+          fi
+        fi
+
+        # Publish the verdict as a check run (best effort — API failures only warn).
+        check_summary="CRITICAL/HIGH vulns: ${vulns}, secrets: ${secrets}, other: ${others}"
+        [ -n "$cve_list" ] && check_summary="${check_summary} — ${cve_list}"
+        check_text=""
+        if [ -n "$vuln_table" ]; then
+          check_text="$(printf '#### Vulnerabilities\n\n| Package | CVE | Severity | Installed | Fixed | Title |\n| --- | --- | --- | --- | --- | --- |\n%s\n' "$vuln_table")"
+        fi
+        gh api -X POST "repos/${GITHUB_REPOSITORY}/check-runs" \
+          -f "name=${CHECK_NAME}" -f "head_sha=${COMMIT}" -f "status=completed" \
+          -f "conclusion=${conclusion}" \
+          -f "output[title]=Trivy gate (${MODE})" \
+          -f "output[summary]=${check_summary}" \
+          -f "output[text]=${check_text}" \
+          || echo "::warning::could not publish check run (missing checks: write?); verdict stays in the job result"
+
+        [ "$conclusion" != "failure" ]

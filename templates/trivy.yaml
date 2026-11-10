@@ -1,0 +1,8 @@
+# OTPKI org-default Trivy policy
+severity:
+  - CRITICAL
+  - HIGH
+scan:
+  scanners:
+    - vuln
+    - secret

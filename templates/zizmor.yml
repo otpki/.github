@@ -1,0 +1,11 @@
+# Shared zizmor policy for all otpki repos. Fetched by
+# reusable-actionlint.yml at lint time (and lint.yml in this repo) via
+# --config; do not add per-repo zizmor.yml files.
+rules:
+  unpinned-uses:
+    config:
+      policies:
+        # First-party actions/workflows are pinned to the v1 release tag on
+        # purpose: the tag is the release boundary. Third-party actions still
+        # require hash pins.
+        "otpki/*": ref-pin

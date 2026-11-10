@@ -1,0 +1,13 @@
+{
+    "name": "OTPKI Go CI",
+    "description": "Standard OTPKI Go checks (format, lint, test, tidy, clean tree) via the shared reusable workflow.",
+    "iconName": "play",
+    "categories": [
+        "Go",
+        "continuous integration"
+    ],
+    "filePatterns": [
+        "go.mod$",
+        "Justfile$"
+    ]
+}

@@ -1,0 +1,36 @@
+name: Resolve OTPKI tool versions
+description: >-
+  Fetch versions.json from otpki/.github (pinned to a tag) and expose each key
+  as a step output, so every repo's CI tracks the org-pinned toolchain.
+outputs:
+  go:
+    description: Pinned Go version (ex. 1.27.3)
+    value: ${{ steps.versions.outputs.go }}
+  node:
+    description: Pinned Node.js version (ex. 26.13.0)
+    value: ${{ steps.versions.outputs.node }}
+inputs:
+  versions-ref:
+    description: >-
+      Git ref of otpki/.github to read versions.json from. A bare ref (ex.
+      "v1") or a full workflow_ref (ex. github.workflow_ref, from which the
+      ref after the last @ is used) are both accepted.
+    required: false
+    default: "v1"
+
+runs:
+  using: composite
+  steps:
+    - name: Fetch versions.json
+      id: versions
+      shell: bash
+      env:
+        REF: ${{ inputs.versions-ref }}
+      run: |
+        set -euo pipefail
+        ref="${REF##*@}"
+        url="https://raw.githubusercontent.com/otpki/.github/${ref}/versions.json"
+        json="$(curl -fsSL "$url")"
+        for key in go node; do
+          echo "${key}=$(jq -r ".${key} // empty" <<<"$json")" >> "$GITHUB_OUTPUT"
+        done

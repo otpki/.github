@@ -1,0 +1,612 @@
+name: Docker publish (reusable)
+
+# Shared image publish for OTPKI repositories (ilm model):
+#   1. pre-build (optional): shared artifacts such as theme jars
+#   2. build-arch: per-arch NATIVE build exported to an OCI layout tar (the
+#      registry is never touched, so no untagged manifests are left behind),
+#      Trivy-scanned under the bundled org policy
+#   3. publish: pushes only the child manifests the final index references
+#      (per-arch image + attestation), creates every tag on the merged index,
+#      mirrors to ghcr.io when asked, signs the index (OCI 1.1 referrers),
+#      attaches an SPDX SBOM (Harbor-format accessory)
+#
+# Nothing user-visible exists until the gates pass: the registry holds nothing
+# for the image until the publish job pushes referenced children and tags.
+#
+# Image repository naming:
+# - Default: $registry_url/$image_prefix-$app
+# - Override: $registry_url/$image_name when image_name is set
+#
+# Tags: latest + extra_tag + git tags on the commit; tag_suffix appended to all.
+# Build args: REGISTRY, BUILDAPP, VERSION, BUILD_TAGS, GIT_BRANCH, GIT_HASH,
+# GIT_TAG, SOURCE_DATE_EPOCH.
+
+on:
+  workflow_call:
+    inputs:
+      registry_url:
+        required: true
+        type: string
+      image_prefix:
+        description: Prefix used for default image naming. Default image repository is registry_url/image_prefix-app.
+        required: true
+        type: string
+      app:
+        description: Logical app/build name. Used in default image naming, BUILDAPP, and logs.
+        required: true
+        type: string
+      target:
+        description: Optional Docker target stage. Leave empty to build the Dockerfile final stage.
+        required: false
+        type: string
+        default: ""
+      file:
+        description: Dockerfile path relative to the repository root.
+        required: false
+        type: string
+        default: Dockerfile
+      platforms:
+        description: Comma-separated Buildx platform list.
+        required: false
+        type: string
+        default: linux/amd64,linux/arm64
+      runner-amd64:
+        description: Runner label for the amd64 build.
+        required: false
+        type: string
+        default: ubuntu-latest
+      runner-arm64:
+        description: Runner label for the arm64 build.
+        required: false
+        type: string
+        default: ubuntu-24.04-arm
+      runner:
+        description: Runner label for the manifest/publish job and any platform not covered above.
+        required: false
+        type: string
+        default: ubuntu-latest
+      image_name:
+        description: Optional repository name after registry_url. Overrides image_prefix-app when set.
+        required: false
+        type: string
+        default: ""
+      tag_suffix:
+        description: Optional suffix appended to latest, extra_tag, and git tags.
+        required: false
+        type: string
+        default: ""
+      build_tags:
+        description: Optional value passed to Docker as BUILD_TAGS.
+        required: false
+        type: string
+        default: ""
+      extra_tag:
+        description: Optional additional Docker tag and VERSION build arg.
+        required: false
+        type: string
+        default: ""
+      cache_from:
+        description: Multiline cache-from entries passed to docker/build-push-action.
+        required: true
+        type: string
+      cache_to:
+        description: Multiline cache-to entries passed to docker/build-push-action.
+        required: true
+        type: string
+      provenance:
+        description: Enable BuildKit provenance attestations.
+        required: false
+        type: boolean
+        default: true
+      sign:
+        description: "Sign the image index with cosign (keyless, OCI 1.1 referrers). Callers still grant id-token: write; the grant is unused when false."
+        required: false
+        type: boolean
+        default: true
+      sbom:
+        description: "Generate an SPDX SBOM and attach it to the image index as a Harbor-format accessory on every registry. The upload-artifact copy is always produced."
+        required: false
+        type: boolean
+        default: true
+      tlog-upload:
+        description: Upload signatures to the public Rekor transparency log. Records only the digest, signature, and workflow identity — never image content. Set false for no public trace.
+        required: false
+        type: boolean
+        default: true
+      ghcr-mirror:
+        description: Also mirror every pushed tag to ghcr.io/<org>/<image> using GITHUB_TOKEN (same digest; signatures go to both when sign is true).
+        required: false
+        type: boolean
+        default: false
+      scan:
+        description: Trivy-scan each arch image under the bundled org policy before tags are created. Enforced on tags, warn elsewhere.
+        required: false
+        type: boolean
+        default: true
+      allow-trivy-config-override:
+        description: "Allow the repo's own Trivy config/.trivyignore to replace the bundled org policy"
+        required: false
+        type: boolean
+        default: false
+      private-repositories:
+        description: Multiline list of extra otpki org repositories the GitHub App token should access (ex. private submodules). Empty uses the caller's GITHUB_TOKEN for checkout and BuildKit.
+        required: false
+        type: string
+        default: ""
+      pre-build-commands:
+        description: Multiline shell commands run before the image build (ex. theme assets). Empty skips the pre-build job.
+        required: false
+        type: string
+        default: ""
+      pre-build-artifacts:
+        description: Path whose contents are shared with the image build jobs.
+        required: false
+        type: string
+        default: ""
+      node-version:
+        description: Node.js version for the pre-build job. Empty skips setup-node.
+        required: false
+        type: string
+        default: ""
+      node-cache-path:
+        description: Dependency file passed to setup-node caching (ex. theme/package-lock.json).
+        required: false
+        type: string
+        default: ""
+    secrets:
+      REGISTRY_USERNAME:
+        required: true
+      REGISTRY_PASSWORD:
+        required: true
+      GH_APP_CLIENT_ID:
+        required: false
+      GH_APP_PRIVATE_KEY:
+        required: false
+
+permissions: {}
+
+jobs:
+  pre-build:
+    name: Pre-build artifacts
+    if: inputs.pre-build-commands != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Resolve tool versions
+        id: versions
+        uses: otpki/.github/.github/actions/tool-versions@v1
+        with:
+          versions-ref: ${{ job.workflow_ref }}
+      - name: Setup Node.js
+        if: inputs.node-version != '' || steps.versions.outputs.node != ''
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ inputs.node-version != '' && inputs.node-version || steps.versions.outputs.node }}
+          cache: npm
+          cache-dependency-path: ${{ inputs.node-cache-path != '' && inputs.node-cache-path || 'package-lock.json' }}
+      - name: Pre-build
+        shell: bash
+        env:
+          PRE_BUILD_COMMANDS: ${{ inputs.pre-build-commands }}
+        run: eval "$PRE_BUILD_COMMANDS"
+      - name: Upload pre-build artifacts
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: pre-build-artifacts-${{ inputs.app }}
+          path: ${{ inputs.pre-build-artifacts }}
+          if-no-files-found: error
+          retention-days: 1
+
+  prep:
+    name: Resolve platform matrix
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+      image-repo: ${{ steps.matrix.outputs.image-repo }}
+    steps:
+      - name: Build arch matrix
+        id: matrix
+        env:
+          PLATFORMS: ${{ inputs.platforms }}
+          R_AMD64: ${{ inputs.runner-amd64 }}
+          R_ARM64: ${{ inputs.runner-arm64 }}
+          R_DEFAULT: ${{ inputs.runner }}
+          IMAGE_NAME: ${{ inputs.image_name != '' && inputs.image_name || format('{0}-{1}', inputs.image_prefix, inputs.app) }}
+          REGISTRY_URL: ${{ inputs.registry_url }}
+        run: |
+          set -euo pipefail
+          matrix="$(printf '%s\n' "$PLATFORMS" | tr ',' '\n' | sed 's|^linux/||' | while read -r arch; do
+            [ -n "$arch" ] || continue
+            runner="$R_DEFAULT"
+            [ "$arch" = "amd64" ] && runner="$R_AMD64"
+            [ "$arch" = "arm64" ] && runner="$R_ARM64"
+            key="${arch//[^a-zA-Z0-9._-]/-}"
+            printf '{"arch":"%s","key":"%s","runner":"%s"}\n' "$arch" "$key" "$runner"
+          done | jq -sc .)"
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+          echo "image-repo=${REGISTRY_URL}/${IMAGE_NAME}" >> "$GITHUB_OUTPUT"
+
+  build-arch:
+    name: Build ${{ matrix.leg.arch }} + scan
+    needs: [pre-build, prep]
+    if: always() && (needs.pre-build.result == 'success' || needs.pre-build.result == 'skipped')
+    strategy:
+      fail-fast: false
+      matrix:
+        leg: ${{ fromJSON(needs.prep.outputs.matrix) }}
+    runs-on: ${{ matrix.leg.runner }}
+    timeout-minutes: 60
+    env:
+      # Trivy defaults to linux/amd64 when resolving an OCI index; each leg's
+      # export only contains its own arch + attestations.
+      TRIVY_PLATFORM: linux/${{ matrix.leg.arch }}
+      # Skip build-push-action's per-leg .dockerbuild record artifacts — with
+      # image matrices they flood the run's artifact list.
+      DOCKER_BUILD_RECORD_UPLOAD: "false"
+    permissions:
+      contents: read
+      checks: write
+      id-token: write
+    steps:
+      - name: Generate GitHub App token
+        id: app-token
+        if: inputs.private-repositories != ''
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3
+        with:
+          client-id: ${{ secrets.GH_APP_CLIENT_ID }}
+          private-key: ${{ secrets.GH_APP_PRIVATE_KEY }}
+          owner: otpki
+          repositories: |
+            ${{ github.event.repository.name }}
+            ${{ inputs.private-repositories }}
+          permission-contents: read
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          token: ${{ inputs.private-repositories != '' && steps.app-token.outputs.token || github.token }}
+          submodules: recursive
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Download pre-build artifacts
+        if: inputs.pre-build-artifacts != ''
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: pre-build-artifacts-${{ inputs.app }}
+          path: ${{ inputs.pre-build-artifacts }}
+
+      - name: Build ${{ inputs.app }} (OCI export)
+        id: build
+        uses: otpki/.github/.github/actions/docker-build-image@v1
+        with:
+          registry_url: ${{ inputs.registry_url }}
+          registry_username: ${{ secrets.REGISTRY_USERNAME }}
+          registry_password: ${{ secrets.REGISTRY_PASSWORD }}
+          image_prefix: ${{ inputs.image_prefix }}
+          app: ${{ inputs.app }}
+          target: ${{ inputs.target }}
+          file: ${{ inputs.file }}
+          platforms: linux/${{ matrix.leg.arch }}
+          oci_export: "true"
+          image_name: ${{ inputs.image_name }}
+          tag_suffix: ${{ inputs.tag_suffix }}
+          build_tags: ${{ inputs.build_tags }}
+          extra_tag: ${{ inputs.extra_tag }}
+          github_token: ${{ inputs.private-repositories != '' && steps.app-token.outputs.token || github.token }}
+          provenance: ${{ inputs.provenance }}
+          cache_from: ${{ inputs.cache_from }}
+          cache_to: ${{ inputs.cache_to }}
+
+      - name: Stage image export
+        env:
+          KEY: ${{ matrix.leg.key }}
+          APP: ${{ inputs.app }}
+        # Artifact names share the run across every caller job (ex. matrix
+        # image variants), so the file is app-scoped inside its artifact too.
+        run: mv image.tar "image-${APP}-${KEY}.tar"
+
+      - name: Upload image export
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: image-${{ inputs.app }}-${{ matrix.leg.key }}
+          path: image-${{ inputs.app }}-${{ matrix.leg.key }}.tar
+          retention-days: 1
+
+      - name: Resolve Trivy policy
+        if: inputs.scan
+        id: trivycfg
+        env:
+          WF_REF: ${{ job.workflow_ref }}
+        run: |
+          set -euo pipefail
+          if ${{ inputs.allow-trivy-config-override }}; then
+            echo "config=" >> "$GITHUB_OUTPUT"
+            echo "trivyignores=" >> "$GITHUB_OUTPUT"
+          else
+            curl -fsSL "https://raw.githubusercontent.com/otpki/.github/${WF_REF##*@}/templates/trivy.yaml" -o "${{ runner.temp }}/trivy.yaml"
+            touch "${{ runner.temp }}/empty-trivyignore"
+            echo "config=${{ runner.temp }}/trivy.yaml" >> "$GITHUB_OUTPUT"
+            echo "trivyignores=${{ runner.temp }}/empty-trivyignore" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Unpack image export for scan
+        if: inputs.scan
+        env:
+          KEY: ${{ matrix.leg.key }}
+          APP: ${{ inputs.app }}
+        run: |
+          mkdir -p image-oci
+          tar -xf "image-${APP}-${KEY}.tar" -C image-oci
+
+      - name: Trivy scan (${{ matrix.leg.arch }} export)
+        if: inputs.scan
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          input: image-oci
+          format: json
+          output: trivy-report.json
+          scanners: vuln,secret
+          trivy-config: ${{ steps.trivycfg.outputs.config }}
+          trivyignores: ${{ steps.trivycfg.outputs.trivyignores }}
+          exit-code: '0'
+
+      - name: Gate verdict
+        if: inputs.scan && always()
+        uses: otpki/.github/.github/actions/trivy-gate-verdict@v1
+        with:
+          trivy-report: trivy-report.json
+          mode: ${{ startsWith(github.ref, 'refs/tags/') && 'enforce' || 'warn' }}
+          check-name: trivy-gate-${{ inputs.app }}-${{ matrix.leg.arch }}
+
+  publish:
+    name: Tag, mirror, sign
+    needs: [prep, build-arch]
+    if: always() && !failure() && !cancelled()
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      id-token: write
+      packages: write
+      checks: write
+    steps:
+      - name: Download image exports
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: image-${{ inputs.app }}-*
+          merge-multiple: true
+          path: exports
+
+      - name: Verify all platform exports are present
+        env:
+          MATRIX: ${{ needs.prep.outputs.matrix }}
+          APP: ${{ inputs.app }}
+        run: |
+          set -euo pipefail
+          # Export files are named image-<app>-<leg>.tar; the download glob
+          # still over-matches prefix-suffixed apps (image-ubuntu-* also grabs
+          # image-ubuntu-dev-*), so verify exact filenames, never a glob.
+          missing=()
+          while IFS= read -r key; do
+            f="exports/image-${APP}-${key}.tar"
+            [ -s "$f" ] || missing+=("$key")
+          done < <(jq -r '.[].key' <<< "$MATRIX")
+          if [ "${#missing[@]}" -gt 0 ]; then
+            echo "missing or empty exports for legs: ${missing[*]}"
+            ls -la exports
+            exit 1
+          fi
+
+      - name: Unpack image exports
+        env:
+          MATRIX: ${{ needs.prep.outputs.matrix }}
+          APP: ${{ inputs.app }}
+        run: |
+          set -euo pipefail
+          while IFS= read -r key; do
+            mkdir -p "oci/$key"
+            tar -xf "exports/image-${APP}-${key}.tar" -C "oci/$key"
+          done < <(jq -r '.[].key' <<< "$MATRIX")
+
+      - name: Compute tags
+        id: tags
+        env:
+          EXTRA: ${{ inputs.extra_tag }}
+          SUFFIX: ${{ inputs.tag_suffix }}
+          GH_TOKEN: ${{ github.token }}
+          REPO_URL: ${{ github.server_url }}/${{ github.repository }}.git
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          tags=(latest)
+          [ -n "$EXTRA" ] && tags+=("$EXTRA")
+          # Tags whose target commit is this SHA — lightweight tags match on the
+          # ref line, annotated tags on the peeled ^{} line. No checkout needed.
+          while IFS= read -r t; do [ -n "$t" ] && tags+=("$t"); done < <(
+            git ls-remote --tags "https://x-access-token:${GH_TOKEN}@${REPO_URL#https://}" \
+              | awk -v sha="$SHA" '$1 == sha { sub("refs/tags/", "", $2); sub(/\^\{\}$/, "", $2); print $2 }'
+          )
+          printf '%s\n' "${tags[@]}" | sort -u | sed "s/$/${SUFFIX}/" > /tmp/tags
+          cat /tmp/tags
+
+      - name: Login to registry
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          registry: ${{ inputs.registry_url }}
+          username: ${{ secrets.REGISTRY_USERNAME }}
+          password: ${{ secrets.REGISTRY_PASSWORD }}
+
+      - name: Login to GHCR
+        if: inputs.ghcr-mirror
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Install regctl
+        uses: regclient/actions/regctl-installer@dd58ad94f76adb73d8ac1bf75ed25f01545d5b32 # v0.2.0
+
+      - name: Login regctl to registry
+        env:
+          REGISTRY_URL: ${{ inputs.registry_url }}
+          REGISTRY_USERNAME: ${{ secrets.REGISTRY_USERNAME }}
+          REGISTRY_PASSWORD: ${{ secrets.REGISTRY_PASSWORD }}
+        run: regctl registry login "${REGISTRY_URL%%/*}" -u "$REGISTRY_USERNAME" -p "$REGISTRY_PASSWORD"
+
+      - name: Push children and create manifests
+        env:
+          REPO: ${{ needs.prep.outputs.image-repo }}
+          GHCR_IMAGE: ghcr.io/${{ github.repository_owner }}/${{ inputs.image_name != '' && inputs.image_name || format('{0}-{1}', inputs.image_prefix, inputs.app) }}
+          MIRROR: ${{ inputs.ghcr-mirror }}
+          MATRIX: ${{ needs.prep.outputs.matrix }}
+          APP: ${{ inputs.app }}
+        run: |
+          set -euo pipefail
+          # index.json in each export points at a bare image manifest
+          # (provenance off) or a nested index holding the image +
+          # attestation manifests. OCI indexes cannot nest, so only the
+          # children are pushed — every pushed manifest ends up referenced
+          # by the final index and nothing untagged is left behind.
+          children=()
+          pushes=()
+          while IFS= read -r key; do
+            dir="$PWD/oci/$key"
+            while IFS= read -r desc; do
+              mt="$(jq -r '.mediaType' <<< "$desc")"
+              dg="$(jq -r '.digest' <<< "$desc")"
+              if [[ "$mt" == *index* || "$mt" == *manifest.list* ]]; then
+                while IFS= read -r cdesc; do
+                  children+=("$cdesc")
+                  pushes+=("$dir@$(jq -r '.digest' <<< "$cdesc")")
+                done < <(jq -c '.manifests[]' "$dir/blobs/sha256/${dg#sha256:}")
+              else
+                children+=("$desc")
+                pushes+=("$dir@$dg")
+              fi
+            done < <(jq -c '.manifests[]' "$dir/index.json")
+          done < <(jq -r '.[].key' <<< "$MATRIX")
+
+          # Child manifests (with their blobs) go to the registry by digest.
+          printf '%s\n' "${pushes[@]}" | sort -u | while IFS= read -r p; do
+            regctl image copy "ocidir://${p%%@*}@${p##*@}" "${REPO}@${p##*@}"
+          done
+
+          # Merge child descriptors verbatim (platform + attestation
+          # annotations) — the same index buildx produces in one push.
+          printf '%s\n' "${children[@]}" | jq -s \
+            '{schemaVersion: 2, mediaType: "application/vnd.oci.image.index.v1+json", manifests: .}' \
+            > merged-index.json
+
+          while IFS= read -r tag; do
+            [ -n "$tag" ] || continue
+            regctl manifest put -t application/vnd.oci.image.index.v1+json \
+              "${REPO}:${tag}" < merged-index.json
+            if [ "$MIRROR" = "true" ]; then
+              docker buildx imagetools create -t "${GHCR_IMAGE}:${tag}" "${REPO}:${tag}"
+            fi
+          done < /tmp/tags
+
+      - id: manifest
+        env:
+          REPO: ${{ needs.prep.outputs.image-repo }}
+          SUFFIX: ${{ inputs.tag_suffix }}
+        run: |
+          set -euo pipefail
+          digest="sha256:$(sha256sum merged-index.json | cut -d' ' -f1)"
+          # The index was just pushed; registries can lag or transiently fail
+          # on read-after-write (observed as silent exit 255), so retry and
+          # confirm the tag resolves to the exact index we built.
+          resolved=""
+          for attempt in 1 2 3 4 5 6; do
+            out="$(docker buildx imagetools inspect "${REPO}:latest${SUFFIX}" 2>&1)" || true
+            resolved="$(printf '%s\n' "$out" | awk '/^Digest:/ {print $2; exit}')"
+            [ "$resolved" = "$digest" ] && break
+            echo "::warning::inspect attempt ${attempt} failed: ${out}" >&2
+            sleep 10
+          done
+          [ "$resolved" = "$digest" ]
+          echo "ref=${REPO}@${digest}" >> "$GITHUB_OUTPUT"
+
+      - name: Install cosign
+        if: inputs.sign
+        uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
+
+      - name: Sign image index
+        if: inputs.sign
+        env:
+          GHCR_IMAGE: ghcr.io/${{ github.repository_owner }}/${{ inputs.image_name != '' && inputs.image_name || format('{0}-{1}', inputs.image_prefix, inputs.app) }}
+          MIRROR: ${{ inputs.ghcr-mirror }}
+          TLOG: ${{ inputs.tlog-upload }}
+          REF: ${{ steps.manifest.outputs.ref }}
+          COSIGN_EXPERIMENTAL: "1"
+        run: |
+          set -euo pipefail
+          cosign sign --yes --tlog-upload="$TLOG" --registry-referrers-mode=oci-1-1 "$REF"
+          if [ "$MIRROR" = "true" ]; then
+            cosign sign --yes --tlog-upload="$TLOG" --registry-referrers-mode=oci-1-1 "${GHCR_IMAGE}@${REF##*@}"
+          fi
+
+      - name: Verify signature resolves
+        if: inputs.sign
+        env:
+          GHCR_IMAGE: ghcr.io/${{ github.repository_owner }}/${{ inputs.image_name != '' && inputs.image_name || format('{0}-{1}', inputs.image_prefix, inputs.app) }}
+          MIRROR: ${{ inputs.ghcr-mirror }}
+          REF: ${{ steps.manifest.outputs.ref }}
+          WF_REPO: ${{ job.workflow_repository }}
+          WF_PATH: ${{ job.workflow_file_path }}
+          COSIGN_EXPERIMENTAL: "1"
+        run: |
+          set -euo pipefail
+          verify() {
+            cosign verify "$1" \
+              --certificate-oidc-issuer=https://token.actions.githubusercontent.com \
+              --certificate-identity-regexp="^https://github\.com/${WF_REPO}/${WF_PATH}@" \
+              >/dev/null
+            echo "verified: $1"
+          }
+          verify "$REF"
+          if [ "$MIRROR" = "true" ]; then
+            verify "${GHCR_IMAGE}@${REF##*@}"
+          fi
+
+      - name: Generate SBOM
+        uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
+        with:
+          image: ${{ steps.manifest.outputs.ref }}
+          output-file: sbom.spdx.json
+
+      - name: Install oras
+        if: inputs.sbom
+        uses: oras-project/setup-oras@5e2f2482b30b0cb3e14e67f89a80c88c659a7c63 # v2.0.3
+
+      - name: Attach SBOM to image
+        if: inputs.sbom
+        env:
+          MANIFEST_REF: ${{ steps.manifest.outputs.ref }}
+          GHCR_IMAGE: ghcr.io/${{ github.repository_owner }}/${{ inputs.image_name != '' && inputs.image_name || format('{0}-{1}', inputs.image_prefix, inputs.app) }}
+          MIRROR: ${{ inputs.ghcr-mirror }}
+        run: |
+          set -euo pipefail
+          oras attach --artifact-type application/vnd.goharbor.harbor.sbom.v1 \
+            "$MANIFEST_REF" sbom.spdx.json:application/spdx+json
+          if [ "$MIRROR" = "true" ]; then
+            oras attach --artifact-type application/vnd.goharbor.harbor.sbom.v1 \
+              "${GHCR_IMAGE}@${MANIFEST_REF##*@}" sbom.spdx.json:application/spdx+json
+          fi
+
+      - name: Upload SBOM artifact
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: sbom-${{ inputs.app }}
+          path: sbom.spdx.json
+          retention-days: 30
