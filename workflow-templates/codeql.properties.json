@@ -1,0 +1,11 @@
+{
+    "name": "OTPKI CodeQL",
+    "description": "CodeQL security analysis via the shared OTPKI reusable workflow.",
+    "iconName": "shield",
+    "categories": [
+        "security"
+    ],
+    "filePatterns": [
+        ".*"
+    ]
+}

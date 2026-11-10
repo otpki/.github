@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Documentation
+    url: https://github.com/otpki/otpki-docs
+    about: Guides and references for OTPKI projects. A good first stop for questions.
+  - name: Security
+    url: https://github.com/otpki/.github/blob/main/SECURITY.md
+    about: Please do not file vulnerabilities as public issues. Report them privately.

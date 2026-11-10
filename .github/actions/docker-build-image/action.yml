@@ -1,0 +1,259 @@
+name: Docker Build Image
+description: Build and push one Docker image with standard OTPKI metadata, tags, secrets, and cache settings
+
+inputs:
+  registry_url:
+    description: Registry host and optional namespace used as the image prefix, for example harbor.example.com/org. Final image repository is registry_url/image_name or registry_url/image_prefix-app.
+    required: true
+  registry_username:
+    description: Username for docker/login-action against registry_url.
+    required: true
+  registry_password:
+    description: Password or token for docker/login-action against registry_url.
+    required: true
+  image_prefix:
+    description: Prefix used in the default image repository name. When image_name is empty, the action publishes registry_url/image_prefix-app.
+    required: true
+  app:
+    description: Logical app/build name. Used in the default image repository name, BUILDAPP build arg, job labels, and logs.
+    required: true
+  target:
+    description: Optional Docker target stage. When empty, the build runs without a target and uses the Dockerfile final stage.
+    required: false
+    default: ""
+  file:
+    description: Dockerfile path relative to the checked-out repository.
+    required: false
+    default: Dockerfile
+  platforms:
+    description: Comma-separated Buildx platform list. Defaults to linux/amd64,linux/arm64. Use linux/amd64 for amd64-only vendor/runtime dependencies.
+    required: false
+    default: linux/amd64,linux/arm64
+  setup_qemu:
+    description: Set to true to install QEMU before Buildx. Leave false when native Buildx workers can build all requested platforms.
+    required: false
+    default: "false"
+  image_name:
+    description: Optional full repository name after registry_url. Overrides the default image_prefix-app naming when set.
+    required: false
+    default: ""
+  tag_suffix:
+    description: Optional suffix appended to every generated Docker tag, including latest, extra_tag, and git tags. Example -base-alpine creates latest-base-alpine.
+    required: false
+    default: ""
+  build_tags:
+    description: Optional value for the BUILD_TAGS Docker build arg. Leave empty if the Dockerfile does not consume BUILD_TAGS.
+    required: false
+    default: ""
+  extra_tag:
+    description: Optional additional Docker tag before tag_suffix is applied, for example v1.0.0. Also becomes the VERSION build arg; VERSION defaults to latest when this is empty.
+    required: false
+    default: ""
+  github_token:
+    description: GitHub token mounted as the github_token BuildKit secret so Dockerfiles can download private GitHub dependencies without baking the token into layers.
+    required: true
+  cache_from:
+    description: Multiline cache-from entries passed directly to docker/build-push-action.
+    required: true
+  cache_to:
+    description: Multiline cache-to entries passed directly to docker/build-push-action.
+    required: true
+  provenance:
+    description: Enable BuildKit provenance attestations.
+    required: false
+    default: "true"
+  push_by_digest:
+    description: Push by digest only (untagged) for per-arch native builds; a later manifest job applies tags after gates pass.
+    required: false
+    default: "false"
+
+outputs:
+  image-digest:
+    description: Digest (sha256) of the pushed image, for cosign sign/attach
+    value: ${{ steps.build-push.outputs.digest || steps.build-push-target.outputs.digest || steps.build-push-plain.outputs.digest }}
+  tags:
+    description: Multiline list of pushed image references (registry/image:tag), one per line
+    value: ${{ steps.docker_meta.outputs.tags }}
+  image-name:
+    description: Resolved image repository name (registry/image)
+    value: ${{ inputs.registry_url }}/${{ steps.meta.outputs.image_name }}
+
+runs:
+  using: composite
+  steps:
+    - name: Set build metadata
+      id: meta
+      shell: bash
+      env:
+        INPUT_IMAGE_NAME: ${{ inputs.image_name }}
+        INPUT_IMAGE_PREFIX: ${{ inputs.image_prefix }}
+        INPUT_APP: ${{ inputs.app }}
+        INPUT_TAG: ${{ inputs.extra_tag }}
+        INPUT_TAG_SUFFIX: ${{ inputs.tag_suffix }}
+      run: |
+        set -euo pipefail
+
+        GIT_HASH="$(git rev-parse --short HEAD)"
+        GIT_BRANCH="${GITHUB_REF_NAME}"
+        SOURCE_DATE_EPOCH="$(git show -s --format=%ct HEAD)"
+
+        IMAGE_NAME="${INPUT_IMAGE_NAME}"
+        if [[ -z "${IMAGE_NAME}" ]]; then
+          IMAGE_NAME="${INPUT_IMAGE_PREFIX}-${INPUT_APP}"
+        fi
+
+        COMMIT_TAGS=()
+        while IFS= read -r tag; do
+          [[ -n "${tag}" ]] || continue
+          COMMIT_TAGS+=("${tag}")
+        done < <(git tag --points-at HEAD | sed '/^$/d')
+        GIT_TAG="$(printf '%s\n' "${COMMIT_TAGS[@]-}" | sed '/^$/d' | paste -sd, -)"
+        DOCKER_METADATA_TAGS=()
+        SEEN_TAGS=()
+
+        has_seen_tag() {
+          local candidate="$1"
+          local seen_tag
+
+          for seen_tag in "${SEEN_TAGS[@]-}"; do
+            [[ -n "${seen_tag}" ]] || continue
+            [[ "${seen_tag}" == "${candidate}" ]] && return 0
+          done
+
+          return 1
+        }
+
+        append_docker_tag() {
+          local tag="$1"
+
+          [[ -n "${tag}" ]] || return 0
+          tag="${tag}${INPUT_TAG_SUFFIX}"
+
+          if ! has_seen_tag "${tag}"; then
+            DOCKER_METADATA_TAGS+=("type=raw,value=${tag}")
+            SEEN_TAGS+=("${tag}")
+          fi
+        }
+
+        append_docker_tag "latest"
+        append_docker_tag "${INPUT_TAG}"
+        for tag in "${COMMIT_TAGS[@]-}"; do
+          append_docker_tag "${tag}"
+        done
+
+        CREATED_ISO="$(date -u -d "@${SOURCE_DATE_EPOCH}" +%Y-%m-%dT%H:%M:%SZ)"
+
+        echo "image_name=${IMAGE_NAME}" >> "$GITHUB_OUTPUT"
+        echo "git_hash=${GIT_HASH}" >> "$GITHUB_OUTPUT"
+        echo "git_branch=${GIT_BRANCH}" >> "$GITHUB_OUTPUT"
+        echo "source_date_epoch=${SOURCE_DATE_EPOCH}" >> "$GITHUB_OUTPUT"
+        echo "git_tag=${GIT_TAG}" >> "$GITHUB_OUTPUT"
+        echo "created_iso=${CREATED_ISO}" >> "$GITHUB_OUTPUT"
+        {
+          echo "docker_metadata_tags<<EOF"
+          printf '%s\n' "${DOCKER_METADATA_TAGS[@]}"
+          echo "EOF"
+        } >> "$GITHUB_OUTPUT"
+
+    - name: Set up QEMU
+      if: ${{ inputs.setup_qemu == 'true' }}
+      uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+    - name: Login to registry
+      uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+      with:
+        registry: ${{ inputs.registry_url }}
+        username: ${{ inputs.registry_username }}
+        password: ${{ inputs.registry_password }}
+
+    - name: Docker metadata
+      id: docker_meta
+      uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+      with:
+        images: ${{ inputs.registry_url }}/${{ steps.meta.outputs.image_name }}
+        tags: ${{ steps.meta.outputs.docker_metadata_tags }}
+        labels: |
+          org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+          org.opencontainers.image.revision=${{ github.sha }}
+          org.opencontainers.image.created=${{ steps.meta.outputs.created_iso }}
+
+    - name: Build and push ${{ inputs.app }} (digest only)
+      id: build-push
+      if: ${{ inputs.push_by_digest == 'true' }}
+      uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+      with:
+        context: .
+        file: ${{ inputs.file }}
+        target: ${{ inputs.target }}
+        platforms: ${{ inputs.platforms }}
+        provenance: ${{ inputs.provenance }}
+        outputs: type=image,name=${{ inputs.registry_url }}/${{ steps.meta.outputs.image_name }},push-by-digest=true,name-canonical=true,push=true
+        build-args: |
+          REGISTRY=${{ inputs.registry_url }}
+          BUILDAPP=${{ inputs.app }}
+          VERSION=${{ inputs.extra_tag || 'latest' }}
+          BUILD_TAGS=${{ inputs.build_tags }}
+          GIT_BRANCH=${{ steps.meta.outputs.git_branch }}
+          GIT_HASH=${{ steps.meta.outputs.git_hash }}
+          GIT_TAG=${{ steps.meta.outputs.git_tag }}
+          SOURCE_DATE_EPOCH=${{ steps.meta.outputs.source_date_epoch }}
+        secrets: |
+          github_token=${{ inputs.github_token }}
+        cache-from: ${{ inputs.cache_from }}
+        cache-to: ${{ inputs.cache_to }}
+
+    - name: Build and push ${{ inputs.app }}
+      id: build-push-target
+      if: ${{ inputs.target != '' && inputs.push_by_digest != 'true' }}
+      uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+      with:
+        context: .
+        file: ${{ inputs.file }}
+        target: ${{ inputs.target }}
+        platforms: ${{ inputs.platforms }}
+        push: true
+        provenance: ${{ inputs.provenance }}
+        tags: ${{ steps.docker_meta.outputs.tags }}
+        labels: ${{ steps.docker_meta.outputs.labels }}
+        build-args: |
+          REGISTRY=${{ inputs.registry_url }}
+          BUILDAPP=${{ inputs.app }}
+          VERSION=${{ inputs.extra_tag || 'latest' }}
+          BUILD_TAGS=${{ inputs.build_tags }}
+          GIT_BRANCH=${{ steps.meta.outputs.git_branch }}
+          GIT_HASH=${{ steps.meta.outputs.git_hash }}
+          GIT_TAG=${{ steps.meta.outputs.git_tag }}
+          SOURCE_DATE_EPOCH=${{ steps.meta.outputs.source_date_epoch }}
+        secrets: |
+          github_token=${{ inputs.github_token }}
+        cache-from: ${{ inputs.cache_from }}
+        cache-to: ${{ inputs.cache_to }}
+
+    - name: Build and push ${{ inputs.app }}
+      id: build-push-plain
+      if: ${{ inputs.target == '' && inputs.push_by_digest != 'true' }}
+      uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+      with:
+        context: .
+        file: ${{ inputs.file }}
+        platforms: ${{ inputs.platforms }}
+        push: true
+        provenance: ${{ inputs.provenance }}
+        tags: ${{ steps.docker_meta.outputs.tags }}
+        labels: ${{ steps.docker_meta.outputs.labels }}
+        build-args: |
+          REGISTRY=${{ inputs.registry_url }}
+          BUILDAPP=${{ inputs.app }}
+          VERSION=${{ inputs.extra_tag || 'latest' }}
+          BUILD_TAGS=${{ inputs.build_tags }}
+          GIT_BRANCH=${{ steps.meta.outputs.git_branch }}
+          GIT_HASH=${{ steps.meta.outputs.git_hash }}
+          GIT_TAG=${{ steps.meta.outputs.git_tag }}
+          SOURCE_DATE_EPOCH=${{ steps.meta.outputs.source_date_epoch }}
+        secrets: |
+          github_token=${{ inputs.github_token }}
+        cache-from: ${{ inputs.cache_from }}
+        cache-to: ${{ inputs.cache_to }}

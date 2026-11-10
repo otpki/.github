@@ -1,0 +1,33 @@
+name: Fast-forward (reusable)
+
+# Shared /fast-forward comment command for OTPKI repositories. Callers trigger
+# on issue_comment and must grant the calling job write permissions:
+#
+#   jobs:
+#     fast-forward:
+#       if: ${{ contains(github.event.comment.body, '/fast-forward')
+#               && github.event.issue.pull_request }}
+#       permissions:
+#         contents: write
+#         pull-requests: write
+#         issues: write
+#       uses: otpki/.github/.github/workflows/reusable-fast-forward.yml@v1
+
+on:
+  workflow_call:
+
+permissions: {}
+
+jobs:
+  fast-forward:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+    steps:
+      - name: Fast forwarding
+        uses: sequoia-pgp/fast-forward@ea7628bedcb0b0b96e94383ada458d812fca4979 # v1.0.0
+        with:
+          merge: true
+          comment: always

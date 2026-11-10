@@ -1,0 +1,16 @@
+name: fast-forward
+
+on:
+  issue_comment:
+    types: [created, edited]
+
+jobs:
+  fast-forward:
+    # Only run when a comment on a pull request contains the command.
+    if: ${{ contains(github.event.comment.body, '/fast-forward')
+            && github.event.issue.pull_request }}
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+    uses: otpki/.github/.github/workflows/reusable-fast-forward.yml@v1

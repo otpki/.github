@@ -1,0 +1,55 @@
+name: Bug report
+description: Something is broken
+title: "[bug]: "
+labels: ["bug"]
+body:
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: One or two sentences. What broke and what you expected.
+      placeholder: "TL;DR: signing fails after a token reconnects, expected the session to recover"
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: How to reproduce it
+      description: Steps or a small code sample. The smaller the better. Use synthetic keys and certificates only — never post real credentials, PINs, or private keys.
+      placeholder: |
+        1. ...
+        2. ...
+        3. ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Fill in the lines that apply.
+      placeholder: |
+        Version: release tag, or go list -m github.com/otpki/<repo>
+        OS/arch: ex. Ubuntu 24.04 amd64
+        Go version: ex. go1.27
+        HSM or simulator: ex. SoftHSM2, nShield, YubiHSM (if applicable)
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: Relevant output, if any. Remove PINs, credentials, and key material before pasting.
+      render: shell
+    validations:
+      required: false
+
+  - type: textarea
+    id: extra
+    attributes:
+      label: Anything else
+      description: Workarounds, versions that used to work, related issues.
+    validations:
+      required: false

@@ -1,0 +1,86 @@
+name: release-sync
+
+# Syncs templates/release.yml (canonical changelog config) to every
+# release-publishing repo. Opens one PR per repo; never commits to main.
+#
+# otpki-ce is intentionally absent: it receives the file through the
+# Community Edition projection of otpki.
+
+on:
+  push:
+    branches: [main]
+    paths: [templates/release.yml]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  REPOS: iogo,otpki,otpki-docs,otpki-keycloak,otpki-pkg,otpki-protobuf,pkcs11,pkcs11-private-vendors
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Generate GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3
+        with:
+          client-id: ${{ secrets.GH_APP_CLIENT_ID }}
+          private-key: ${{ secrets.GH_APP_PRIVATE_KEY }}
+          owner: otpki
+          repositories: ${{ env.REPOS }}
+          permission-contents: write
+          permission-pull-requests: write
+
+      - name: Sync release config to repos
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          set -euo pipefail
+
+          put_file() {
+            local repo="$1" path="$2" file="$3" branch="$4"
+            local sha_args=()
+            if gh api "repos/otpki/${repo}/contents/${path}" --jq '.sha' > /tmp/sha 2>/dev/null; then
+              sha_args=(-f "sha=$(cat /tmp/sha)")
+            fi
+            gh api -X PUT "repos/otpki/${repo}/contents/${path}" \
+              -f "message=Sync ${path} from otpki/.github" \
+              -f "content=$(base64 -w0 "$file")" \
+              -f "branch=${branch}" "${sha_args[@]}"
+          }
+
+          for repo in ${REPOS//,/ }; do
+            changed=0
+
+            # release.yml is canonical — sync when content differs.
+            current="$(gh api "repos/otpki/${repo}/contents/.github/release.yml" --jq '.content' 2>/dev/null | tr -d '\n' || true)"
+            if [ "$current" != "$(base64 -w0 templates/release.yml)" ]; then
+              changed=1
+            fi
+
+
+            [ "$changed" -eq 1 ] || { echo "${repo}: up to date"; continue; }
+
+            branch="chore/release-config-sync"
+            if gh pr list --repo "otpki/${repo}" --head "${branch}" --state open --json number --jq '.[0].number' | grep -q .; then
+              echo "${repo}: sync PR already open"; continue
+            fi
+
+            gh api -X POST "repos/otpki/${repo}/git/refs" \
+              -f "ref=refs/heads/${branch}" \
+              -f "sha=$(gh api "repos/otpki/${repo}/git/refs/heads/main" --jq '.object.sha')"
+
+            [ "$current" = "$(base64 -w0 templates/release.yml)" ] || \
+              put_file "$repo" ".github/release.yml" templates/release.yml "$branch"
+
+            gh pr create --repo "otpki/${repo}" --base main --head "${branch}" \
+              --title "chore: sync release config from otpki/.github" \
+              --body "Syncs \`.github/release.yml\` changelog config. Source of truth: otpki/.github templates/release.yml."
+            echo "${repo}: PR opened"
+          done

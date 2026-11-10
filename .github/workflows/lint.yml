@@ -1,0 +1,55 @@
+name: lint
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: lint-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  actionlint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Resolve Go version
+        id: versions
+        run: echo "go=$(jq -r .go versions.json)" >> "$GITHUB_OUTPUT"
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: ${{ steps.versions.outputs.go }}
+          check-latest: true
+      - name: Install shellcheck
+        run: sudo apt-get install -y shellcheck
+      - name: Install actionlint
+        run: go install github.com/rhysd/actionlint/cmd/actionlint@latest
+      - name: Lint reusable workflows
+        run: actionlint -oneline -ignore 'property "workflow_(ref|sha|repository|file_path)" is not defined' .github/workflows/*.yml
+      - name: Validate composite action manifests
+        run: |
+          for f in .github/actions/*/action.yml; do
+            node -e "
+              const fs = require('fs');
+              const doc = fs.readFileSync('$f', 'utf8');
+              if (!/runs:\s*\n\s*using:\s*(composite|node\d+|docker)/s.test(doc)) {
+                console.error('$f: missing runs.using'); process.exit(1);
+              }
+              console.log('$f: ok');
+            "
+          done
+      - name: Lint starter workflow templates
+        run: actionlint -oneline workflow-templates/*.yml
+      - name: Validate template metadata
+        run: |
+          for f in workflow-templates/*.properties.json; do
+            jq -e '.name and .iconName' "$f" >/dev/null || exit 1
+          done
+      - name: zizmor security scan
+        run: docker run --rm -v "$PWD:/repo" -w /repo ghcr.io/zizmorcore/zizmor:latest --config templates/zizmor.yml --format plain .github workflow-templates

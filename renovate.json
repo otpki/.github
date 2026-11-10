@@ -1,0 +1,57 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "description": "Shared OTPKI renovate config — repos extend with github>otpki/.github:renovate.json",
+  "extends": [
+    "config:best-practices",
+    "group:allNonMajor",
+    "schedule:weekly"
+  ],
+  "dependencyDashboard": true,
+  "labels": ["dependencies"],
+  "packageRules": [
+    {
+      "matchManagers": ["github-actions"],
+      "pinDigests": true
+    },
+    {
+      "matchManagers": ["gomod"],
+      "groupName": "go-dependencies",
+      "matchUpdateTypes": ["minor", "patch"]
+    },
+    {
+      "matchManagers": ["npm"],
+      "groupName": "npm-dependencies",
+      "matchUpdateTypes": ["minor", "patch"]
+    },
+    {
+      "matchManagers": ["buf"],
+      "groupName": "buf-dependencies"
+    },
+    {
+      "matchFileNames": ["**/.aqua.yaml", "**/.aqua.registry.yaml"],
+      "groupName": "aqua-tools"
+    },
+    {
+      "matchDatasources": ["docker"],
+      "groupName": "docker-images"
+    }
+  ],
+  "customManagers": [
+    {
+      "customType": "regex",
+      "managerFilePatterns": ["/\\.aqua\\.ya?ml$/"],
+      "matchStrings": [
+        "ref:\\s*(?<currentValue>\\S+)\\s*#\\s*renovate:\\s*depName=(?<depName>\\S+)"
+      ],
+      "datasourceTemplate": "github-releases"
+    },
+    {
+      "customType": "regex",
+      "managerFilePatterns": ["/\\.aqua\\.ya?ml$/"],
+      "matchStrings": [
+        "-\\s*name:\\s*(?<depName>[a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+)@(?<currentValue>v?[\\d.]+)"
+      ],
+      "datasourceTemplate": "github-releases"
+    }
+  ]
+}

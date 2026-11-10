@@ -1,0 +1,4 @@
+# Default owners for all OTPKI repositories.
+# Repositories can override by defining their own CODEOWNERS.
+
+* @otpki/dev-team

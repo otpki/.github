@@ -1,0 +1,11 @@
+{
+    "name": "OTPKI fast-forward",
+    "description": "Merge pull requests by commenting /fast-forward, via the shared reusable workflow.",
+    "iconName": "git-pull-request",
+    "categories": [
+        "automation"
+    ],
+    "filePatterns": [
+        ".*"
+    ]
+}
