@@ -22,7 +22,7 @@ Released under the [Apache License 2.0](https://github.com/otpki/otpki-ce/blob/m
 
 | Repository                                                | What it is                                                                                                                                          |
 | --------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------- |
-| [otpki-ce](https://github.com/otpki/otpki-ce)             | Certificate issuance, enrollment, and validation services (Community Edition)                                                                       |
+| [otpki](https://github.com/otpki/otpki)                   | Certificate issuance, enrollment, and validation services.                                                                                          |
 | [pkcs11](https://github.com/otpki/pkcs11)                 | Go client for PKCS #11 v3.2, plus `pkcs11-proxy`: a remote HSM broker with route-per-token discovery, active-active replicas, and signed audit logs |
 | [iogo](https://github.com/otpki/iogo)                     | Standalone Go toolchain fork with post-quantum crypto (CIRCL) integration                                                                           |
 | [otpki-pkg](https://github.com/otpki/otpki-pkg)           | Shared Go libraries for OTPKI services                                                                                                              |
